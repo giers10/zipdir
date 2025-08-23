@@ -152,6 +152,25 @@ def collect_files(src_dir: Path, excludes: Iterable[str]) -> List[Path]:
 
     return include_files
 
+def next_available_path(path: Path) -> Path:
+    """
+    If `path` exists, return 'stem-1.suffix', 'stem-2.suffix', ... until unused.
+    Example: out.zip -> out-1.zip -> out-2.zip ...
+    """
+    path = path.resolve()
+    if not path.exists():
+        return path
+
+    parent = path.parent
+    stem = path.stem
+    suffix = path.suffix
+    i = 1
+    while True:
+        candidate = parent / f"{stem}-{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
 def make_zip(src_dir: Path, zip_path: Path, extra_excludes: Iterable[str] = ()) -> int:
     """
     Create zip_path from src_dir while skipping default and extra_excludes patterns.
@@ -202,16 +221,20 @@ def main(argv: List[str] | None = None) -> int:
     ignore_file = ns.zipignore if ns.zipignore is not None else (src / ".zipignore")
     extra.extend(load_ignore_file(ignore_file))
 
-    files = collect_files(src, extra)
+    # Choose a non-clobbering output path (appends -1, -2, ...)
+    final_out = next_available_path(out)
 
     if ns.list:
-        print(f"Would include {len(files)} files:\n")
+        files = collect_files(src, extra)
+        print(f"Would create {final_out} with {len(files)} files:\n")
         for fp in files:
             print(fp.relative_to(src).as_posix())
         return 0
 
-    count = make_zip(src, out, extra_excludes=extra)
-    print(f"Created {out} with {count} files from {src}")
+    count = make_zip(src, final_out, extra_excludes=extra)
+    if final_out != out:
+        print(f"Note: '{out}' already exists. Using '{final_out.name}'.")
+    print(f"Created {final_out} with {count} files from {src}")
     return 0
 
 if __name__ == "__main__":
