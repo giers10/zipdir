@@ -22,13 +22,24 @@ You can extend ignoring with --exclude globs or a .zipignore file (one glob per 
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import os
 from pathlib import Path
 import posixpath
 import sys
 import zipfile
 from typing import Iterable, List, Set
+
+# Use real .gitignore semantics
+try:
+    from pathspec import PathSpec
+    from pathspec.patterns.gitwildmatch import GitWildMatchPattern
+except ImportError:
+    print(
+        "Error: This script now uses 'pathspec' for .gitignore-compatible matching.\n"
+        "Install it with:\n  python -m pip install pathspec",
+        file=sys.stderr,
+    )
+    raise SystemExit(3)
 
 # --- Defaults ---
 
@@ -83,70 +94,104 @@ def load_ignore_file(path: Path) -> List[str]:
         pass
     return patterns
 
-def is_hidden(path: Path) -> bool:
-    """Return True if any component of path starts with a dot ('.')."""
-    for part in path.parts:
-        if part.startswith("."):
-            return True
-    return False
+def _collect_negation_prefixes(patterns: Iterable[str]) -> Set[str]:
+    """
+    From a sequence of GitIgnore-style patterns, collect directory prefixes that
+    appear in negations (patterns starting with '!'). We use these to avoid
+    pruning directories that might contain re-included files.
+    """
+    prefixes: Set[str] = set()
+    for raw in patterns:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("!"):
+            continue
 
-def normalize_rel(path: Path, root: Path) -> str:
-    """Return POSIX-style relative path from root to path."""
-    rel = path.relative_to(root)
-    return rel.as_posix()
+        pat = line[1:].lstrip("/")  # drop '!' and leading root anchor
+        if not pat:
+            continue
 
-def should_exclude(rel_posix: str, name: str, is_dir: bool, *, name_dir_set: Set[str], name_file_set: Set[str], glob_set: Iterable[str]) -> bool:
-    """Decide if an item should be excluded based on name sets, hidden-ness, and glob rules."""
-    # Hidden files/folders
-    if any(seg.startswith(".") for seg in rel_posix.split("/")):
-        return True
+        # If the pattern ends with '/', it's a directory; otherwise grab parents.
+        is_dir_pat = pat.endswith("/")
+        path_no_slash = pat[:-1] if is_dir_pat else pat
+        parts = [p for p in path_no_slash.split("/") if p]
 
-    # Direct name checks
-    if is_dir and name in name_dir_set:
-        return True
-    if not is_dir and name in name_file_set:
-        return True
+        # Add all parent directory prefixes ending with '/'
+        if parts:
+            accum = ""
+            for i in range(len(parts) - (0 if is_dir_pat else 1)):
+                accum = f"{accum}{parts[i]}/"
+                prefixes.add(accum)
 
-    # Glob checks against the relative posix path
-    for pat in glob_set:
-        if fnmatch.fnmatchcase(rel_posix, pat):
-            return True
+        # Also, if it explicitly targets a directory, include that directory
+        if is_dir_pat:
+            prefixes.add(path_no_slash + "/")
+        elif len(parts) > 1:
+            # file under a dir: add its parent dir
+            prefixes.add("/".join(parts[:-1]) + "/")
 
-    return False
+    return prefixes
+
+
+def build_ignore_spec(excludes: Iterable[str]) -> tuple[PathSpec, Set[str]]:
+    """
+    Build a PathSpec with .gitignore semantics from defaults + user patterns.
+    Returns (spec, negation_prefixes).
+    """
+    lines: List[str] = []
+
+    # Default "hidden everything" like your original behavior (can be overridden via !)
+    # In .gitignore semantics, patterns without '/' match in any directory.
+    lines.append(".*")
+
+    # Convert default directory names into dir patterns (match anywhere)
+    for d in DEFAULT_EXCLUDED_DIR_NAMES:
+        # 'd/' matches that directory at any depth
+        lines.append(f"{d}/")
+
+    # Default file names (match anywhere)
+    for f in DEFAULT_EXCLUDED_FILE_NAMES:
+        lines.append(f)
+
+    # Existing glob-style defaults (already POSIX). These work under gitwild too.
+    lines.extend(DEFAULT_EXCLUDED_GLOBS)
+
+    # User/CLI/.zipignore additions (support '/', '**', and '!' negations)
+    lines.extend(excludes)
+
+    spec = PathSpec.from_lines(GitWildMatchPattern, lines)
+    neg_prefixes = _collect_negation_prefixes(lines)
+    return spec, neg_prefixes
+
 
 def collect_files(src_dir: Path, excludes: Iterable[str]) -> List[Path]:
-    """Traverse src_dir and return a list of file Paths that should be included."""
+    """
+    Traverse src_dir and return a list of file Paths to include, honoring
+    .gitignore-style patterns. We prune directories when the spec ignores them
+    AND no negation ('!') pattern could re-include something beneath.
+    """
     src_dir = src_dir.resolve()
     include_files: List[Path] = []
 
-    # Compile combined glob set
-    combined_globs: Set[str] = set(DEFAULT_EXCLUDED_GLOBS)
-    combined_globs.update(excludes)
+    spec, neg_prefixes = build_ignore_spec(excludes)
 
-    # Walk and prune
     for root, dirs, files in os.walk(src_dir, topdown=True, followlinks=False):
         root_path = Path(root)
         rel_root = root_path.relative_to(src_dir).as_posix() if root_path != src_dir else ""
 
-        # Prune directories in-place
-        pruned: List[str] = []
-        for d in list(dirs):  # iterate over a copy since we'll modify dirs
-            d_rel = posixpath.join(rel_root, d) if rel_root else d
-            if should_exclude(d_rel, d, True,
-                              name_dir_set=DEFAULT_EXCLUDED_DIR_NAMES,
-                              name_file_set=DEFAULT_EXCLUDED_FILE_NAMES,
-                              glob_set=combined_globs):
-                pruned.append(d)
-        if pruned:
-            dirs[:] = [d for d in dirs if d not in pruned]
+        # Prune directories (but keep if a later '!' could re-include children)
+        for d in list(dirs):
+            d_rel = (posixpath.join(rel_root, d) if rel_root else d) + "/"
+            if spec.match_file(d_rel):
+                # If any negation prefix lies inside d_rel, don't prune
+                if not any(neg.startswith(d_rel) for neg in neg_prefixes):
+                    dirs.remove(d)
 
         # Files
         for f in files:
             f_rel = posixpath.join(rel_root, f) if rel_root else f
-            if should_exclude(f_rel, f, False,
-                              name_dir_set=DEFAULT_EXCLUDED_DIR_NAMES,
-                              name_file_set=DEFAULT_EXCLUDED_FILE_NAMES,
-                              glob_set=combined_globs):
+            if spec.match_file(f_rel):
                 continue
             include_files.append(root_path / f)
 
