@@ -1,7 +1,7 @@
 # zipdir — Smart folder zipper (skip the junk)
 
 `zipdir.py` zips a directory while **skipping common junk/build/cache files** so your archives stay lean and clean. It also **won’t overwrite** an existing archive — if `out.zip` exists, it will create `out-1.zip`, `out-2.zip`, … automatically.
- 
+ test
 ---
 
 ## Features
