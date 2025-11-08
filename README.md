@@ -173,7 +173,7 @@ Auto‑incrementing output is handled via `next_available_path(Path("out.zip"))`
 
 ## License
 
-MIT — do what you want, no warranty.
+MIT
 
 ---
 
