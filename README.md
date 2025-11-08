@@ -176,7 +176,7 @@ Auto‑incrementing output is handled via `next_available_path(Path("out.zip"))`
 MIT
 
 ---
-
+test
 ## Changelog (highlights)
 
 * **v1.1**: Non‑clobbering output (`out.zip` → `out-1.zip`, …)
